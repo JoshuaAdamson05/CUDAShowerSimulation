@@ -14,6 +14,8 @@ public:
 
 	unsigned int rngState;
 
+	int active;
+
 	__device__ float random01()
 	{
 		rngState = (rngState * 1664525u + 1013904223u);
@@ -43,6 +45,26 @@ public:
 
 		mass = 1.0f;
 		temperature = 1.0f;
+		active = 1;
+	}
+
+	__device__ void mergeWith(Particle& other)
+	{
+		float combinedMass = mass + other.mass;
+
+		position.x = ((position.x * mass) + (other.position.x * other.mass)) / combinedMass;
+		position.y = ((position.y * mass) + (other.position.y * other.mass)) / combinedMass;
+		position.z = ((position.z * mass) + (other.position.z * other.mass)) / combinedMass;
+
+		velocity.x = ((velocity.x * mass) + (other.velocity.x * other.mass)) / combinedMass;
+		velocity.y = ((velocity.y * mass) + (other.velocity.y * other.mass)) / combinedMass;
+		velocity.z = ((velocity.z * mass) + (other.velocity.z * other.mass)) / combinedMass;
+
+		temperature = ((temperature * mass) + (other.temperature * other.mass)) / combinedMass;
+
+		mass = combinedMass;
+
+		other.active = 0;
 	}
 
 	__device__ void applyPhysics(float deltaTime)

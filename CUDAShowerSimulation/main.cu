@@ -9,6 +9,16 @@ constexpr float WIDTH = 1.0f;
 constexpr float HEIGHT = 2.0f;
 constexpr float DEPTH = 1.0f;
 constexpr float DELTA_TIME = 1.0f / 60.0f;
+constexpr float COLLISION_RADIUS = 0.0001f;
+constexpr float CELL_SIZE = 0.02f;
+
+constexpr int GRID_X = static_cast<int>(WIDTH / CELL_SIZE) + 1;
+constexpr int GRID_Y = static_cast<int>(HEIGHT / CELL_SIZE) + 1;
+constexpr int GRID_Z = static_cast<int>(DEPTH / CELL_SIZE) + 1;
+
+constexpr int NUM_CELLS = GRID_X * GRID_Y * GRID_Z;
+
+static_assert(NUM_CELLS > 0, "NUM_CELLS must be positive");
 
 #define checkCudaError(call) \
 do \
@@ -31,38 +41,161 @@ __global__ void initialiseParticlesKernel(Particle* particles, int numParticles,
 	particles[i].spawn(width, height, depth);
 }
 
-__global__ void updateParticlesKernel(Particle* particles, int numParticles, unsigned int* floorHits, float* totalTemperature, float deltaTime, float width, float height, float depth)
+__global__ void updateParticlesKernel(Particle* particles, int numParticles, unsigned int* floorHits, float deltaTime, float width, float height, float depth)
 {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i >= numParticles)
+	if (i >= numParticles || particles[i].active != 1)
 		return;
 
 	Particle& particle = particles[i];
 
 	particle.applyPhysics(deltaTime);
 	particle.handleWalls(width, depth);
-	particle.cool(deltaTime);
 
 	if (particle.hasHitFloor())
 	{
 		atomicAdd(floorHits, 1u);
 		particle.spawn(width, height, depth);
 	}
-
-	atomicAdd(totalTemperature, particle.temperature);
 }
+
+__global__ void updateTemperatureKernel(Particle* particles, int numParticles, float deltaTime)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= numParticles || particles[i].active != 1)
+		return;
+	particles[i].cool(deltaTime);
+}
+
+__global__ void calculateParticleStatsKernel(Particle* particles, int numParticles, unsigned int* activeParticles, float* totalTemperature)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= numParticles || particles[i].active != 1)
+		return;
+
+	atomicAdd(activeParticles, 1u);
+	atomicAdd(totalTemperature, particles[i].temperature);
+}
+
+__device__ int getCellIndex(float3 position)
+{
+	int cellX = static_cast<int>(position.x / CELL_SIZE);
+	int cellY = static_cast<int>(position.y / CELL_SIZE);
+	int cellZ = static_cast<int>(position.z / CELL_SIZE);
+
+	cellX = max(0, min(cellX, GRID_X - 1));
+	cellY = max(0, min(cellY, GRID_Y - 1));
+	cellZ = max(0, min(cellZ, GRID_Z - 1));
+
+	return (cellY * GRID_Z + cellZ) * GRID_X + cellX;
+}
+
+__global__ void buildGridKernel(Particle* particles, int numParticles, int* cellHeads, int* nextParticle)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i >= numParticles || particles[i].active != 1)
+		return;
+
+	int cellIndex = getCellIndex(particles[i].position);
+	nextParticle[i] = atomicExch(&cellHeads[cellIndex], i);
+}
+
+__global__ void mergeParticlesKernel(Particle* particles, int numParticles, int* cellHeads, int* nextParticle, unsigned int* mergeCount)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= numParticles)
+		return;
+
+	// Lock the particle - 0 = inactive, 1 = active, 2 = locked for merging
+	if (atomicCAS(&particles[i].active, 1, 2) != 1)
+		return;
+	
+	float3 position = particles[i].position;
+
+	int cellX = static_cast<int>(position.x / CELL_SIZE);
+	int cellY = static_cast<int>(position.y / CELL_SIZE);
+	int cellZ = static_cast<int>(position.z / CELL_SIZE);
+
+	cellX = max(0, min(cellX, GRID_X - 1));
+	cellY = max(0, min(cellY, GRID_Y - 1));
+	cellZ = max(0, min(cellZ, GRID_Z - 1));
+
+	float collisionDistanceSq = COLLISION_RADIUS * COLLISION_RADIUS;
+
+	for (int y = -1; y <= 1; y++)
+	{
+		for (int z = -1; z <= 1; z++)
+		{
+			for (int x = -1; x <= 1; x++)
+			{
+				int neighborX = cellX + x;
+				int neighborY = cellY + y;
+				int neighborZ = cellZ + z;
+
+				if (neighborX < 0 || neighborX >= GRID_X ||
+					neighborY < 0 || neighborY >= GRID_Y ||
+					neighborZ < 0 || neighborZ >= GRID_Z)
+				{
+					continue;
+				}
+
+				int neighbourCell = (neighborY * GRID_Z + neighborZ) * GRID_X + neighborX;
+
+				int j = cellHeads[neighbourCell];
+
+				while (j != -1)
+				{
+					if (j != i)
+					{
+						float3 otherPosition = particles[j].position;
+
+						float dx = position.x - otherPosition.x;
+						float dy = position.y - otherPosition.y;
+						float dz = position.z - otherPosition.z;
+						float distSq = dx * dx + dy * dy + dz * dz;
+						if (distSq < collisionDistanceSq)
+						{
+							if (atomicCAS(&particles[j].active, 1, 0) == 1)
+							{
+								particles[i].mergeWith(particles[j]);
+								atomicAdd(mergeCount, 1u);
+							}
+						}
+					}
+
+					// Move to the next particle in the cell
+					j = nextParticle[j];
+				}
+			}
+		}
+	}
+
+	// Unlock the particle
+	particles[i].active = 1;
+}	
 
 int main()
 {
 	Particle* d_particles = nullptr;
 	unsigned int* d_floorHits = nullptr;
+	unsigned int* d_activeParticles = nullptr;
 	float* d_totalTemperature = nullptr;
+
+	int* d_cellHeads = nullptr;
+	int* d_nextParticle = nullptr;
+	unsigned int* d_mergeCount = nullptr;
 
     checkCudaError(cudaMalloc(&d_particles, NUM_PARTICLES * sizeof(Particle)));
 	checkCudaError(cudaMalloc(&d_floorHits, sizeof(unsigned int)));
+	checkCudaError(cudaMalloc(&d_activeParticles, sizeof(unsigned int)));
 	checkCudaError(cudaMalloc(&d_totalTemperature, sizeof(float)));
+	checkCudaError(cudaMalloc(&d_cellHeads, NUM_CELLS * sizeof(int)));
+	checkCudaError(cudaMalloc(&d_nextParticle, NUM_PARTICLES * sizeof(int)));
+	checkCudaError(cudaMalloc(&d_mergeCount, sizeof(unsigned int)));
 
 	checkCudaError(cudaMemset(d_floorHits, 0, sizeof(unsigned int)));
+	checkCudaError(cudaMemset(d_mergeCount, 0, sizeof(unsigned int)));
 
 	int blocks = (NUM_PARTICLES + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
@@ -73,6 +206,7 @@ int main()
 	checkCudaError(cudaEventCreate(&endEvent));
 
 	initialiseParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, WIDTH, HEIGHT, DEPTH);
+	checkCudaError(cudaGetLastError());
 	checkCudaError(cudaDeviceSynchronize());
 
 	for (int frame = 0; frame < 1000; frame++)
@@ -81,7 +215,21 @@ int main()
 
 		checkCudaError(cudaEventRecord(startEvent));
 
-		updateParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_floorHits, d_totalTemperature, DELTA_TIME, WIDTH, HEIGHT, DEPTH);
+		updateParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_floorHits, DELTA_TIME, WIDTH, HEIGHT, DEPTH);
+		checkCudaError(cudaGetLastError());
+		checkCudaError(cudaDeviceSynchronize());
+
+		checkCudaError(cudaMemset(d_cellHeads, -1, NUM_CELLS * sizeof(int)));
+
+		buildGridKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle);
+		checkCudaError(cudaGetLastError());
+		checkCudaError(cudaDeviceSynchronize());
+
+		mergeParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle, d_mergeCount);
+		checkCudaError(cudaGetLastError());
+		checkCudaError(cudaDeviceSynchronize());
+
+		updateTemperatureKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, DELTA_TIME);
 		checkCudaError(cudaGetLastError());
 		checkCudaError(cudaDeviceSynchronize());
 
@@ -95,18 +243,34 @@ int main()
 			unsigned int floorHits = 0;
 			float totalTemperature = 0.0f;
 			checkCudaError(cudaMemcpy(&floorHits, d_floorHits, sizeof(unsigned int), cudaMemcpyDeviceToHost));
-			checkCudaError(cudaMemcpy(&totalTemperature, d_totalTemperature, sizeof(float), cudaMemcpyDeviceToHost));
 
-			float averageTemperature = totalTemperature / NUM_PARTICLES;
-			std::cout << "Frame: " << frame << " | Particles: " << NUM_PARTICLES << " | Floor Hits: " << floorHits << " | Avg Temperature: " << averageTemperature << " | GPU Update: " << milliseconds << " ms" << std::endl;
+			checkCudaError(cudaMemset(d_activeParticles, 0, sizeof(unsigned int)));
+
+			calculateParticleStatsKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_activeParticles, d_totalTemperature);
+			checkCudaError(cudaGetLastError());
+			checkCudaError(cudaDeviceSynchronize());
+
+			unsigned int mergeCount = 0;
+			checkCudaError(cudaMemcpy(&mergeCount, d_mergeCount, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+
+			unsigned int activeParticles = 0;
+			checkCudaError(cudaMemcpy(&activeParticles, d_activeParticles, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+
+			checkCudaError(cudaMemcpy(&totalTemperature, d_totalTemperature, sizeof(float), cudaMemcpyDeviceToHost));
+			float averageTemperature = activeParticles > 0 ? totalTemperature / activeParticles : 0.0f;
+			std::cout << "Frame: " << frame << " | Particles: " << NUM_PARTICLES << " | Active: " << activeParticles << " | Merges: " << mergeCount << " | Floor Hits: " << floorHits << " | Avg Temperature: " << averageTemperature << " | GPU Update: " << milliseconds << " ms" << std::endl;
 		}
 	}
 
 	checkCudaError(cudaFree(d_particles));
+	checkCudaError(cudaFree(d_activeParticles));
 	checkCudaError(cudaFree(d_floorHits));
 	checkCudaError(cudaFree(d_totalTemperature));
+	checkCudaError(cudaFree(d_cellHeads));
+	checkCudaError(cudaFree(d_nextParticle));
 	checkCudaError(cudaEventDestroy(startEvent));
 	checkCudaError(cudaEventDestroy(endEvent));
+	checkCudaError(cudaFree(d_mergeCount));
 
 	return 0;
 }
