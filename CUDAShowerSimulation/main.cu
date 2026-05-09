@@ -31,7 +31,7 @@ __global__ void initialiseParticlesKernel(Particle* particles, int numParticles,
 	particles[i].spawn(width, height, depth);
 }
 
-__global__ void updateParticlesKernel(Particle* particles, int numParticles, unsigned int* floorHits, float deltaTime, float width, float height, float depth)
+__global__ void updateParticlesKernel(Particle* particles, int numParticles, unsigned int* floorHits, float* totalTemperature, float deltaTime, float width, float height, float depth)
 {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= numParticles)
@@ -48,38 +48,65 @@ __global__ void updateParticlesKernel(Particle* particles, int numParticles, uns
 		atomicAdd(floorHits, 1u);
 		particle.spawn(width, height, depth);
 	}
+
+	atomicAdd(totalTemperature, particle.temperature);
 }
 
 int main()
 {
 	Particle* d_particles = nullptr;
 	unsigned int* d_floorHits = nullptr;
+	float* d_totalTemperature = nullptr;
 
     checkCudaError(cudaMalloc(&d_particles, NUM_PARTICLES * sizeof(Particle)));
 	checkCudaError(cudaMalloc(&d_floorHits, sizeof(unsigned int)));
+	checkCudaError(cudaMalloc(&d_totalTemperature, sizeof(float)));
 
 	checkCudaError(cudaMemset(d_floorHits, 0, sizeof(unsigned int)));
 
 	int blocks = (NUM_PARTICLES + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
+	cudaEvent_t startEvent;
+	cudaEvent_t endEvent;
+
+	checkCudaError(cudaEventCreate(&startEvent));
+	checkCudaError(cudaEventCreate(&endEvent));
+
 	initialiseParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, WIDTH, HEIGHT, DEPTH);
-	cudaDeviceSynchronize();
+	checkCudaError(cudaDeviceSynchronize());
 
 	for (int frame = 0; frame < 1000; frame++)
 	{
-		updateParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_floorHits, DELTA_TIME, WIDTH, HEIGHT, DEPTH);
-		cudaDeviceSynchronize();
+		checkCudaError(cudaMemset(d_totalTemperature, 0, sizeof(float)));
+
+		checkCudaError(cudaEventRecord(startEvent));
+
+		updateParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_floorHits, d_totalTemperature, DELTA_TIME, WIDTH, HEIGHT, DEPTH);
+		checkCudaError(cudaGetLastError());
+		checkCudaError(cudaDeviceSynchronize());
+
+		checkCudaError(cudaEventRecord(endEvent));
+		checkCudaError(cudaEventSynchronize(endEvent));
+		float milliseconds = 0.0f;
+		checkCudaError(cudaEventElapsedTime(&milliseconds, startEvent, endEvent));
 
 		if (frame % 60 == 0)
 		{
 			unsigned int floorHits = 0;
+			float totalTemperature = 0.0f;
 			checkCudaError(cudaMemcpy(&floorHits, d_floorHits, sizeof(unsigned int), cudaMemcpyDeviceToHost));
-			std::cout << "Frame: " << frame << " | Particles: " << NUM_PARTICLES << " | Floor Hits: " << floorHits << std::endl;
+			checkCudaError(cudaMemcpy(&totalTemperature, d_totalTemperature, sizeof(float), cudaMemcpyDeviceToHost));
+
+			float averageTemperature = totalTemperature / NUM_PARTICLES;
+			std::cout << "Frame: " << frame << " | Particles: " << NUM_PARTICLES << " | Floor Hits: " << floorHits << " | Avg Temperature: " << averageTemperature << " | GPU Update: " << milliseconds << " ms" << std::endl;
 		}
 	}
 
 	checkCudaError(cudaFree(d_particles));
 	checkCudaError(cudaFree(d_floorHits));
+	checkCudaError(cudaFree(d_totalTemperature));
+	checkCudaError(cudaEventDestroy(startEvent));
+	checkCudaError(cudaEventDestroy(endEvent));
 
 	return 0;
 }
