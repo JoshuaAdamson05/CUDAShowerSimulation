@@ -18,7 +18,10 @@ public:
 
 	__device__ float random01()
 	{
+		// Linear Congruential Generator (LCG) for per-particle random numbers
 		rngState = (rngState * 1664525u + 1013904223u);
+
+		// Return a float in the range [0, 1]
 		return (rngState & 0xFFFFFF) / 16777216.0f;
 	}
 

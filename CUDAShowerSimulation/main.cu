@@ -37,7 +37,9 @@ __global__ void initialiseParticlesKernel(Particle* particles, int numParticles,
 	if (i >= numParticles)
 		return;
 
+	// Initialize RNG state with a unique seed for each particle
 	particles[i].rngState = 1234u + i * 9781u;
+
 	particles[i].spawn(width, height, depth);
 }
 
@@ -69,12 +71,41 @@ __global__ void updateTemperatureKernel(Particle* particles, int numParticles, f
 
 __global__ void calculateParticleStatsKernel(Particle* particles, int numParticles, unsigned int* activeParticles, float* totalTemperature)
 {
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i >= numParticles || particles[i].active != 1)
-		return;
+	__shared__ unsigned int sharedActive[BLOCK_SIZE];
+	__shared__ float sharedTemperature[BLOCK_SIZE];
 
-	atomicAdd(activeParticles, 1u);
-	atomicAdd(totalTemperature, particles[i].temperature);
+	int threadId = threadIdx.x;
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+	unsigned int localActive = 0;
+	float localTemperature = 0.0f;
+
+	if (i < numParticles && particles[i].active == 1)
+	{
+		localActive = 1;
+		localTemperature = particles[i].temperature;
+	}
+
+	sharedActive[threadId] = localActive;
+	sharedTemperature[threadId] = localTemperature;
+
+	__syncthreads();
+
+	for (int stride = blockDim.x / 2; stride > 0; stride /= 2)
+	{
+		if (threadId < stride)
+		{
+			sharedActive[threadId] += sharedActive[threadId + stride];
+			sharedTemperature[threadId] += sharedTemperature[threadId + stride];
+		}
+		__syncthreads();
+	}
+
+	if (threadId == 0)
+	{
+		atomicAdd(activeParticles, sharedActive[0]);
+		atomicAdd(totalTemperature, sharedTemperature[0]);
+	}
 }
 
 __device__ int getCellIndex(float3 position)
@@ -241,9 +272,12 @@ int main()
 		if (frame % 60 == 0)
 		{
 			unsigned int floorHits = 0;
-			float totalTemperature = 0.0f;
 			checkCudaError(cudaMemcpy(&floorHits, d_floorHits, sizeof(unsigned int), cudaMemcpyDeviceToHost));
 
+			float totalTemperature = 0.0f;
+			checkCudaError(cudaMemset(d_totalTemperature, 0, sizeof(float)));
+
+			unsigned int activeParticles = 0;
 			checkCudaError(cudaMemset(d_activeParticles, 0, sizeof(unsigned int)));
 
 			calculateParticleStatsKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_activeParticles, d_totalTemperature);
@@ -253,7 +287,6 @@ int main()
 			unsigned int mergeCount = 0;
 			checkCudaError(cudaMemcpy(&mergeCount, d_mergeCount, sizeof(unsigned int), cudaMemcpyDeviceToHost));
 
-			unsigned int activeParticles = 0;
 			checkCudaError(cudaMemcpy(&activeParticles, d_activeParticles, sizeof(unsigned int), cudaMemcpyDeviceToHost));
 
 			checkCudaError(cudaMemcpy(&totalTemperature, d_totalTemperature, sizeof(float), cudaMemcpyDeviceToHost));
