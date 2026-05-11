@@ -1,7 +1,12 @@
 ﻿#include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+
 #include <iostream>
+#include <vector>
+
 #include "Particle.cuh"
+#include "Rendering.h"
+#include "OpenGLRenderer.h"
 
 constexpr int NUM_PARTICLES = 100000;
 constexpr int BLOCK_SIZE = 256;
@@ -11,6 +16,7 @@ constexpr float DEPTH = 1.0f;
 constexpr float DELTA_TIME = 1.0f / 60.0f;
 constexpr float COLLISION_RADIUS = 0.0001f;
 constexpr float CELL_SIZE = 0.02f;
+constexpr float EMITTER_RADIUS = 0.05f;
 
 constexpr int GRID_X = static_cast<int>(WIDTH / CELL_SIZE) + 1;
 constexpr int GRID_Y = static_cast<int>(HEIGHT / CELL_SIZE) + 1;
@@ -206,8 +212,29 @@ __global__ void mergeParticlesKernel(Particle* particles, int numParticles, int*
 	particles[i].active = 1;
 }	
 
-int main()
+void runCudaSimulationStep(Particle* d_particles, unsigned int* d_floorHits, int* d_cellHeads, int* d_nextParticle, unsigned int* d_mergedCount, int blocks)
 {
+	updateParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_floorHits, DELTA_TIME, WIDTH, HEIGHT, DEPTH);
+	checkCudaError(cudaGetLastError());
+	checkCudaError(cudaDeviceSynchronize());
+
+	checkCudaError(cudaMemset(d_cellHeads, -1, NUM_CELLS * sizeof(int)));
+
+	buildGridKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle);
+	checkCudaError(cudaGetLastError());
+	checkCudaError(cudaDeviceSynchronize());
+
+	mergeParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle, d_mergedCount);
+	checkCudaError(cudaGetLastError());
+	checkCudaError(cudaDeviceSynchronize());
+
+	updateTemperatureKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, DELTA_TIME);
+	checkCudaError(cudaGetLastError());
+	checkCudaError(cudaDeviceSynchronize());
+}
+
+int main()
+{	
 	Particle* d_particles = nullptr;
 	unsigned int* d_floorHits = nullptr;
 	unsigned int* d_activeParticles = nullptr;
@@ -225,9 +252,6 @@ int main()
 	checkCudaError(cudaMalloc(&d_nextParticle, NUM_PARTICLES * sizeof(int)));
 	checkCudaError(cudaMalloc(&d_mergeCount, sizeof(unsigned int)));
 
-	checkCudaError(cudaMemset(d_floorHits, 0, sizeof(unsigned int)));
-	checkCudaError(cudaMemset(d_mergeCount, 0, sizeof(unsigned int)));
-
 	int blocks = (NUM_PARTICLES + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
 	cudaEvent_t startEvent;
@@ -240,59 +264,80 @@ int main()
 	checkCudaError(cudaGetLastError());
 	checkCudaError(cudaDeviceSynchronize());
 
-	for (int frame = 0; frame < 1000; frame++)
+	OpenGLRenderer renderer(900, 700, "CUDA Shower Simulation");
+
+	std::vector<Particle> h_particles(NUM_PARTICLES);	
+
+	std::vector<RenderVertex> particleVertices;
+	std::vector<RenderVertex> cubicleVertices = buildCubicleVertices(WIDTH, HEIGHT, DEPTH);
+	std::vector<RenderVertex> showerHeadVertices = buildShowerHeadVertices(WIDTH, HEIGHT, DEPTH, EMITTER_RADIUS);
+
+	RenderMode renderMode = RenderMode::Mass;
+
+	int renderStride = 100;
+	int frame = 0;
+
+	while (!renderer.shouldClose())
 	{
-		checkCudaError(cudaMemset(d_totalTemperature, 0, sizeof(float)));
+		renderer.pollEvents();
+
+		if (renderer.isKeyPressed(GLFW_KEY_ESCAPE))
+		{
+			break;
+		}
+
+		if (renderer.isKeyPressed(GLFW_KEY_T))
+		{
+			renderMode = RenderMode::Thermal;
+		}
+		
+		if (renderer.isKeyPressed(GLFW_KEY_M))
+		{
+			renderMode = RenderMode::Mass;
+		}
 
 		checkCudaError(cudaEventRecord(startEvent));
 
-		updateParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_floorHits, DELTA_TIME, WIDTH, HEIGHT, DEPTH);
-		checkCudaError(cudaGetLastError());
-		checkCudaError(cudaDeviceSynchronize());
-
-		checkCudaError(cudaMemset(d_cellHeads, -1, NUM_CELLS * sizeof(int)));
-
-		buildGridKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle);
-		checkCudaError(cudaGetLastError());
-		checkCudaError(cudaDeviceSynchronize());
-
-		mergeParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle, d_mergeCount);
-		checkCudaError(cudaGetLastError());
-		checkCudaError(cudaDeviceSynchronize());
-
-		updateTemperatureKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, DELTA_TIME);
-		checkCudaError(cudaGetLastError());
-		checkCudaError(cudaDeviceSynchronize());
+		runCudaSimulationStep(d_particles, d_floorHits, d_cellHeads, d_nextParticle, d_mergeCount, blocks);
 
 		checkCudaError(cudaEventRecord(endEvent));
 		checkCudaError(cudaEventSynchronize(endEvent));
-		float milliseconds = 0.0f;
-		checkCudaError(cudaEventElapsedTime(&milliseconds, startEvent, endEvent));
 
-		if (frame % 60 == 0)
+		checkCudaError(cudaMemcpy(h_particles.data(), d_particles, NUM_PARTICLES * sizeof(Particle), cudaMemcpyDeviceToHost));
+
+		particleVertices = buildRenderVertices(h_particles, renderMode, renderStride, WIDTH, HEIGHT, DEPTH);
+
+		renderer.drawFrame(particleVertices, cubicleVertices, showerHeadVertices);
+
+		if (frame % 300 == 0)
 		{
-			unsigned int floorHits = 0;
-			checkCudaError(cudaMemcpy(&floorHits, d_floorHits, sizeof(unsigned int), cudaMemcpyDeviceToHost));
-
-			float totalTemperature = 0.0f;
-			checkCudaError(cudaMemset(d_totalTemperature, 0, sizeof(float)));
-
 			unsigned int activeParticles = 0;
+			unsigned int floorHits = 0;
+			unsigned int mergeCount = 0;
+			float totalTemperature = 0.0f;
+
 			checkCudaError(cudaMemset(d_activeParticles, 0, sizeof(unsigned int)));
+			checkCudaError(cudaMemset(d_totalTemperature, 0, sizeof(float)));
 
 			calculateParticleStatsKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_activeParticles, d_totalTemperature);
 			checkCudaError(cudaGetLastError());
 			checkCudaError(cudaDeviceSynchronize());
 
-			unsigned int mergeCount = 0;
-			checkCudaError(cudaMemcpy(&mergeCount, d_mergeCount, sizeof(unsigned int), cudaMemcpyDeviceToHost));
-
 			checkCudaError(cudaMemcpy(&activeParticles, d_activeParticles, sizeof(unsigned int), cudaMemcpyDeviceToHost));
-
+			checkCudaError(cudaMemcpy(&floorHits, d_floorHits, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+			checkCudaError(cudaMemcpy(&mergeCount, d_mergeCount, sizeof(unsigned int), cudaMemcpyDeviceToHost));
 			checkCudaError(cudaMemcpy(&totalTemperature, d_totalTemperature, sizeof(float), cudaMemcpyDeviceToHost));
+
 			float averageTemperature = activeParticles > 0 ? totalTemperature / activeParticles : 0.0f;
-			std::cout << "Frame: " << frame << " | Particles: " << NUM_PARTICLES << " | Active: " << activeParticles << " | Merges: " << mergeCount << " | Floor Hits: " << floorHits << " | Avg Temperature: " << averageTemperature << " | GPU Update: " << milliseconds << " ms" << std::endl;
+
+			std::cout << "Frame: " << frame
+				<< " | Active Particles: " << activeParticles
+				<< " | Floor Hits: " << floorHits
+				<< " | Merges: " << mergeCount
+				<< " | Average Temperature: " << averageTemperature
+				<< std::endl;
 		}
+		frame++;
 	}
 
 	checkCudaError(cudaFree(d_particles));

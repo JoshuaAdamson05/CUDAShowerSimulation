@@ -28,22 +28,22 @@ public:
 	__device__ void spawn(float width, float height, float depth)
 	{
 		const float emitterRadius = 0.05f;
-		const float initialSpeed = 2.0f;
+		const float speed = 2.0f;
 
-		float angle = random01() * 2.0f * 3.14159265f;
+		float emitterAngle = random01() * 2.0f * 3.14159265f;
 		float radius = sqrtf(random01()) * emitterRadius;
 
-		position.x = width * 0.5f + radius * cosf(angle);
+		position.x = width * 0.5f + radius * cosf(emitterAngle);
 		position.y = height;
-		position.z = depth * 0.5f + radius * sinf(angle);
+		position.z = depth * 0.5f + radius * sinf(emitterAngle);
 
-		float coneAngle = (random01() * 60.0f - 30.0f) * 0.0174533f; // Convert to radians
+		float coneAngle = random01() * 30.0f * 0.0174533f; // Convert to radians
 		float azimuth = random01() * 2.0f * 3.14159265f;
 
-		float horizontalSpeed = sinf(fabsf(coneAngle)) * initialSpeed;
+		float horizontalSpeed = speed * sinf(coneAngle);
 
 		velocity.x = horizontalSpeed * cosf(azimuth);
-		velocity.y = -cosf(coneAngle) * initialSpeed;
+		velocity.y = cosf(coneAngle) * -speed;
 		velocity.z = horizontalSpeed * sinf(azimuth);
 
 		mass = 1.0f;
@@ -74,7 +74,8 @@ public:
 	{
 		const float gravity = -9.81f;
 
-		velocity.y += gravity * deltaTime;
+		if (position.y > 0.0f)
+			velocity.y += gravity * deltaTime;
 
 		position.x += velocity.x * deltaTime;
 		position.y += velocity.y * deltaTime;
@@ -110,6 +111,11 @@ public:
 		if (temperature < 0.0f) 
 		{
 			temperature = 0.0f;
+		}
+
+		if (temperature > 1.0f)
+		{
+			temperature = 1.0f;
 		}
 	}
 

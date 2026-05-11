@@ -80,7 +80,12 @@
     <CudaCompile Include="main.cu" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="OpenGLRenderer.h" />
     <ClInclude Include="Particle.cuh" />
+    <ClInclude Include="Rendering.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="OpenGLRenderer.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
