@@ -191,12 +191,15 @@ __global__ void mergeParticlesKernel(Particle* particles, int numParticles, int*
 						float dy = position.y - otherPosition.y;
 						float dz = position.z - otherPosition.z;
 						float distSq = dx * dx + dy * dy + dz * dz;
-						if (distSq < collisionDistanceSq)
+						if (distSq <= collisionDistanceSq)
 						{
 							if (atomicCAS(&particles[j].active, 1, 0) == 1)
 							{
 								particles[i].mergeWith(particles[j]);
 								atomicAdd(mergeCount, 1u);
+
+								particles[i].active = 3; // Mark as merged but not yet unlocked
+								return;
 							}
 						}
 					}
@@ -208,9 +211,21 @@ __global__ void mergeParticlesKernel(Particle* particles, int numParticles, int*
 		}
 	}
 
-	// Unlock the particle
-	particles[i].active = 1;
+	particles[i].active = 3;
 }	
+
+__global__ void resetSurvivorsKernel(Particle* particles, int numParticles)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i >= numParticles)
+		return;
+
+	if (particles[i].active == 3)
+	{
+		particles[i].active = 1; // Unlock merged particles for the next iteration
+	}
+}
 
 void runCudaSimulationStep(Particle* d_particles, unsigned int* d_floorHits, int* d_cellHeads, int* d_nextParticle, unsigned int* d_mergedCount, int blocks)
 {
@@ -225,6 +240,10 @@ void runCudaSimulationStep(Particle* d_particles, unsigned int* d_floorHits, int
 	checkCudaError(cudaDeviceSynchronize());
 
 	mergeParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle, d_mergedCount);
+	checkCudaError(cudaGetLastError());
+	checkCudaError(cudaDeviceSynchronize());
+
+	resetSurvivorsKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES);
 	checkCudaError(cudaGetLastError());
 	checkCudaError(cudaDeviceSynchronize());
 
