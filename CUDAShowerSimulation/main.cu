@@ -279,6 +279,8 @@ int main()
 	checkCudaError(cudaEventCreate(&startEvent));
 	checkCudaError(cudaEventCreate(&endEvent));
 
+	float totalGpuFrameTime = 0.0f;
+
 	initialiseParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, WIDTH, HEIGHT, DEPTH);
 	checkCudaError(cudaGetLastError());
 	checkCudaError(cudaDeviceSynchronize());
@@ -322,6 +324,10 @@ int main()
 		checkCudaError(cudaEventRecord(endEvent));
 		checkCudaError(cudaEventSynchronize(endEvent));
 
+		float frameMilliseconds = 0.0f;
+		checkCudaError(cudaEventElapsedTime(&frameMilliseconds, startEvent, endEvent));
+		totalGpuFrameTime += frameMilliseconds;
+
 		checkCudaError(cudaMemcpy(h_particles.data(), d_particles, NUM_PARTICLES * sizeof(Particle), cudaMemcpyDeviceToHost));
 
 		particleVertices = buildRenderVertices(h_particles, renderMode, renderStride, WIDTH, HEIGHT, DEPTH);
@@ -354,6 +360,8 @@ int main()
 				<< " | Floor Hits: " << floorHits
 				<< " | Merges: " << mergeCount
 				<< " | Average Temperature: " << averageTemperature
+				<< " | GPU Frame Time: " << frameMilliseconds << " ms"
+				<< " | Average GPU Frame Time: " << (totalGpuFrameTime / (frame + 1)) << " ms"
 				<< std::endl;
 		}
 		frame++;
