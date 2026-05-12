@@ -8,7 +8,7 @@
 #include "Rendering.h"
 #include "OpenGLRenderer.h"
 
-constexpr int NUM_PARTICLES = 20000;
+constexpr int NUM_PARTICLES = 100000;
 constexpr int BLOCK_SIZE = 256;
 constexpr float WIDTH = 1.0f;
 constexpr float HEIGHT = 2.0f;
@@ -214,8 +214,6 @@ __global__ void mergeParticlesKernel(Particle* particles, int numParticles, int*
 			}
 		}
 	}
-
-	particles[i].active = 3;
 }	
 
 __global__ void resetSurvivorsKernel(Particle* particles, int numParticles)
@@ -231,7 +229,7 @@ __global__ void resetSurvivorsKernel(Particle* particles, int numParticles)
 	}
 }
 
-void runCudaSimulationStep(Particle* d_particles, unsigned int* d_floorHits, int* d_cellHeads, int* d_nextParticle, unsigned int* d_mergedCount, int blocks)
+void runCudaSimulationStep(Particle* d_particles, unsigned int* d_floorHits, int* d_cellHeads, int* d_nextParticle, unsigned int* d_frameMerges, int blocks)
 {
 	updateParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_floorHits, DELTA_TIME, WIDTH, HEIGHT, DEPTH);
 	checkCudaError(cudaGetLastError());
@@ -243,7 +241,8 @@ void runCudaSimulationStep(Particle* d_particles, unsigned int* d_floorHits, int
 	checkCudaError(cudaGetLastError());
 	checkCudaError(cudaDeviceSynchronize());
 
-	mergeParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle, d_mergedCount);
+	checkCudaError(cudaMemset(d_frameMerges, 0, sizeof(unsigned int)));
+	mergeParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle, d_frameMerges);
 	checkCudaError(cudaGetLastError());
 	checkCudaError(cudaDeviceSynchronize());
 
@@ -265,7 +264,9 @@ int main()
 
 	int* d_cellHeads = nullptr;
 	int* d_nextParticle = nullptr;
-	unsigned int* d_mergeCount = nullptr;
+	unsigned int* d_frameMerges = nullptr;
+	unsigned int totalMerges = 0;
+	unsigned int mergesSinceLastLog = 0;
 
     checkCudaError(cudaMalloc(&d_particles, NUM_PARTICLES * sizeof(Particle)));
 	checkCudaError(cudaMalloc(&d_floorHits, sizeof(unsigned int)));
@@ -273,7 +274,7 @@ int main()
 	checkCudaError(cudaMalloc(&d_totalTemperature, sizeof(float)));
 	checkCudaError(cudaMalloc(&d_cellHeads, NUM_CELLS * sizeof(int)));
 	checkCudaError(cudaMalloc(&d_nextParticle, NUM_PARTICLES * sizeof(int)));
-	checkCudaError(cudaMalloc(&d_mergeCount, sizeof(unsigned int)));
+	checkCudaError(cudaMalloc(&d_frameMerges, sizeof(unsigned int)));
 
 	int blocks = (NUM_PARTICLES + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
@@ -323,10 +324,16 @@ int main()
 
 		checkCudaError(cudaEventRecord(startEvent));
 
-		runCudaSimulationStep(d_particles, d_floorHits, d_cellHeads, d_nextParticle, d_mergeCount, blocks);
+		runCudaSimulationStep(d_particles, d_floorHits, d_cellHeads, d_nextParticle, d_frameMerges, blocks);
 
 		checkCudaError(cudaEventRecord(endEvent));
 		checkCudaError(cudaEventSynchronize(endEvent));
+
+		unsigned int frameMerges = 0;
+		checkCudaError(cudaMemcpy(&frameMerges, d_frameMerges, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+		totalMerges += frameMerges;
+
+		mergesSinceLastLog += frameMerges;
 
 		float frameMilliseconds = 0.0f;
 		checkCudaError(cudaEventElapsedTime(&frameMilliseconds, startEvent, endEvent));
@@ -342,7 +349,6 @@ int main()
 		{
 			unsigned int activeParticles = 0;
 			unsigned int floorHits = 0;
-			unsigned int mergeCount = 0;
 			float totalTemperature = 0.0f;
 
 			checkCudaError(cudaMemset(d_activeParticles, 0, sizeof(unsigned int)));
@@ -354,7 +360,6 @@ int main()
 
 			checkCudaError(cudaMemcpy(&activeParticles, d_activeParticles, sizeof(unsigned int), cudaMemcpyDeviceToHost));
 			checkCudaError(cudaMemcpy(&floorHits, d_floorHits, sizeof(unsigned int), cudaMemcpyDeviceToHost));
-			checkCudaError(cudaMemcpy(&mergeCount, d_mergeCount, sizeof(unsigned int), cudaMemcpyDeviceToHost));
 			checkCudaError(cudaMemcpy(&totalTemperature, d_totalTemperature, sizeof(float), cudaMemcpyDeviceToHost));
 
 			float averageTemperature = activeParticles > 0 ? totalTemperature / activeParticles : 0.0f;
@@ -362,11 +367,14 @@ int main()
 			std::cout << "Frame: " << frame
 				<< " | Active Particles: " << activeParticles
 				<< " | Floor Hits: " << floorHits
-				<< " | Merges: " << mergeCount
+				<< " | Merges Since Last Log: " << mergesSinceLastLog
+				<< " | Total Merges: " << totalMerges
 				<< " | Average Temperature: " << averageTemperature
 				<< " | GPU Frame Time: " << frameMilliseconds << " ms"
 				<< " | Average GPU Frame Time: " << (totalGpuFrameTime / (frame + 1)) << " ms"
 				<< std::endl;
+
+			mergesSinceLastLog = 0;
 		}
 		frame++;
 	}
@@ -379,7 +387,7 @@ int main()
 	checkCudaError(cudaFree(d_nextParticle));
 	checkCudaError(cudaEventDestroy(startEvent));
 	checkCudaError(cudaEventDestroy(endEvent));
-	checkCudaError(cudaFree(d_mergeCount));
+	checkCudaError(cudaFree(d_frameMerges));
 
 	return 0;
 }
