@@ -8,7 +8,7 @@
 #include "Rendering.h"
 #include "OpenGLRenderer.h"
 
-constexpr int NUM_PARTICLES = 100000;
+constexpr int NUM_PARTICLES = 20000;
 constexpr int BLOCK_SIZE = 256;
 constexpr float WIDTH = 1.0f;
 constexpr float HEIGHT = 2.0f;
@@ -144,8 +144,7 @@ __global__ void mergeParticlesKernel(Particle* particles, int numParticles, int*
 	if (i >= numParticles)
 		return;
 
-	// Lock the particle - 0 = inactive, 1 = active, 2 = locked for merging
-	if (atomicCAS(&particles[i].active, 1, 2) != 1)
+	if (particles[i].active != 1)
 		return;
 	
 	float3 position = particles[i].position;
@@ -183,7 +182,7 @@ __global__ void mergeParticlesKernel(Particle* particles, int numParticles, int*
 
 				while (j != -1)
 				{
-					if (j != i)
+					if (j != i && particles[j].active == 1)
 					{
 						float3 otherPosition = particles[j].position;
 
@@ -193,6 +192,9 @@ __global__ void mergeParticlesKernel(Particle* particles, int numParticles, int*
 						float distSq = dx * dx + dy * dy + dz * dz;
 						if (distSq <= collisionDistanceSq)
 						{
+							if (atomicCAS(&particles[i].active, 1, 2) != 1)
+								return;
+
 							if (atomicCAS(&particles[j].active, 1, 0) == 1)
 							{
 								particles[i].mergeWith(particles[j]);
@@ -201,6 +203,8 @@ __global__ void mergeParticlesKernel(Particle* particles, int numParticles, int*
 								particles[i].active = 3; // Mark as merged but not yet unlocked
 								return;
 							}
+
+							particles[i].active = 1; // Unlock if merge failed
 						}
 					}
 
