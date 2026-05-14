@@ -1,6 +1,7 @@
 #pragma once	
 
 #include <vector>
+#include <algorithm>
 
 #include "Particle.cuh"
 
@@ -45,70 +46,162 @@ inline void temperatureColour(float temperature, float& r, float& g, float& b)
 
 inline void massColour(float mass, float& r, float& g, float& b)
 {
-	if (mass < 2.0f)
+	if (mass < 1.1f)
 	{
-		r = 0.0f;
-		g = 0.5f;
-		b = 1.0f;
+		r = 0.0f; g = 0.5f; b = 1.0f; // blue = original / low mass
 	}
-	else if (mass < 5.0f)
+	else if (mass < 2.1f)
 	{
-		r = 0.0f;
-		g = 1.0f;
-		b = 0.0f;
+		r = 0.0f; g = 1.0f; b = 0.0f; // green = mass 2-ish
 	}
-	else if (mass < 10.0f)
+	else if (mass < 3.1f)
 	{
-		r = 1.0f;
-		g = 1.0f;
-		b = 0.0f;
+		r = 1.0f; g = 1.0f; b = 0.0f; // yellow = mass 3-ish
 	}
 	else
 	{
-		r = 1.0f;
-		g = 0.0f;
-		b = 0.0f;
+		r = 1.0f; g = 0.0f; b = 0.0f; // red = mass 4+
 	}
 }
 
-inline std::vector<RenderVertex> buildRenderVertices(const std::vector<Particle>& particles, RenderMode mode, int renderStride, float width, float height, float depth)
+inline std::vector<RenderVertex> buildRenderVertices(
+	const std::vector<Particle>& particles,
+	RenderMode mode,
+	int renderStride,
+	float width,
+	float height,
+	float depth)
 {
-	std::vector<RenderVertex> vertices;
-	vertices.reserve(particles.size() / renderStride);
+	const int stride = std::max(1, renderStride);
 
+	std::vector<RenderVertex> vertices;
+
+	auto addVertex = [&](const Particle& particle)
+		{
+			RenderVertex vertex;
+
+			worldTo3D(
+				particle.position.x,
+				particle.position.y,
+				particle.position.z,
+				width,
+				height,
+				depth,
+				vertex.x,
+				vertex.y,
+				vertex.z
+			);
+
+			if (mode == RenderMode::Thermal)
+			{
+				temperatureColour(particle.temperature, vertex.r, vertex.g, vertex.b);
+			}
+			else
+			{
+				massColour(particle.mass, vertex.r, vertex.g, vertex.b);
+			}
+
+			vertices.push_back(vertex);
+		};
+
+	// Normal thermal rendering: simple active-particle stride
+	if (mode == RenderMode::Thermal)
+	{
+		int activeCounter = 0;
+
+		for (const Particle& particle : particles)
+		{
+			if (particle.active != 1)
+			{
+				continue;
+			}
+
+			if (activeCounter % stride == 0)
+			{
+				addVertex(particle);
+			}
+
+			activeCounter++;
+		}
+
+		return vertices;
+	}
+
+	// Mass mode: prioritise merged/high-mass particles so tiers are visible
+	std::vector<size_t> activeIndices;
+
+	for (size_t i = 0; i < particles.size(); i++)
+	{
+		if (particles[i].active == 1)
+		{
+			activeIndices.push_back(i);
+		}
+	}
+
+	const size_t targetCount = std::max<size_t>(1, activeIndices.size() / stride);
+	vertices.reserve(targetCount);
+
+	// Sort by mass descending so the largest merged particles are selected first
+	std::sort(activeIndices.begin(), activeIndices.end(),
+		[&](size_t a, size_t b)
+		{
+			return particles[a].mass > particles[b].mass;
+		}
+	);
+
+	// Select high-mass particles first
+	std::vector<size_t> selectedIndices;
+	selectedIndices.reserve(targetCount);
+
+	for (size_t index : activeIndices)
+	{
+		if (selectedIndices.size() >= targetCount / 2)
+		{
+			break;
+		}
+
+		if (particles[index].mass > 1.05f)
+		{
+			selectedIndices.push_back(index);
+		}
+	}
+
+	// Fill the rest with normal strided active particles
 	int activeCounter = 0;
 
 	for (size_t i = 0; i < particles.size(); i++)
 	{
-		const Particle& particle = particles[i];
-
-		if (particle.active != 1)
+		if (particles[i].active != 1)
 		{
 			continue;
 		}
 
-		if (activeCounter % renderStride != 0)
+		if (activeCounter % stride == 0)
 		{
-			activeCounter++;
-			continue;
+			selectedIndices.push_back(i);
+
+			if (selectedIndices.size() >= targetCount)
+			{
+				break;
+			}
 		}
 
 		activeCounter++;
-
-		RenderVertex vertex;
-
-		worldTo3D(particle.position.x, particle.position.y, particle.position.z, width, height, depth, vertex.x, vertex.y, vertex.z);
-
-		if (mode == RenderMode::Thermal)
-		{
-			temperatureColour(particle.temperature, vertex.r, vertex.g, vertex.b);
-		}
-		else
-		{
-			massColour(particle.mass, vertex.r, vertex.g, vertex.b);
-		}
-		vertices.push_back(vertex);
 	}
+
+	// Draw low mass first and high mass last, so coloured merged particles are not hidden
+	std::sort(selectedIndices.begin(), selectedIndices.end(),
+		[&](size_t a, size_t b)
+		{
+			return particles[a].mass < particles[b].mass;
+		}
+	);
+
+	for (size_t index : selectedIndices)
+	{
+		addVertex(particles[index]);
+	}
+
 	return vertices;
 }
 
