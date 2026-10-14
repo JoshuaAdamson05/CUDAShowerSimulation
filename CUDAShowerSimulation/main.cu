@@ -6,6 +6,7 @@
 #include <chrono>
 #include <array>
 #include <iomanip>
+#include <algorithm>
 
 #include "Particle.cuh"
 #include "Rendering.h"
@@ -20,6 +21,9 @@ constexpr float DELTA_TIME = 1.0f / 60.0f;
 constexpr float COLLISION_RADIUS = 0.0001f;
 constexpr float CELL_SIZE = 0.005f;
 constexpr float EMITTER_RADIUS = 0.05f;
+constexpr int RENDER_STRIDE = 100;
+constexpr int MAX_RENDER_VERTICES = (NUM_PARTICLES + RENDER_STRIDE - 1) / RENDER_STRIDE;
+constexpr int MASS_PRIORITY_QUOTA = MAX_RENDER_VERTICES / 2;
 
 constexpr int GRID_X = static_cast<int>(WIDTH / CELL_SIZE) + 1;
 constexpr int GRID_Y = static_cast<int>(HEIGHT / CELL_SIZE) + 1;
@@ -29,6 +33,7 @@ constexpr int NUM_CELLS = GRID_X * GRID_Y * GRID_Z;
 
 static_assert(NUM_CELLS > 0, "NUM_CELLS must be positive");
 static_assert(CELL_SIZE >= COLLISION_RADIUS, "CELL_SIZE must be at least as large as COLLISION_RADIUS for the 27-cell neighbour search");
+static_assert(MAX_RENDER_VERTICES > 0, "MAX_RENDER_VERTICES must be positive");
 
 #define checkCudaError(call) \
 do \
@@ -47,9 +52,7 @@ __global__ void initialiseParticlesKernel(Particle* particles, int numParticles,
 	if (i >= numParticles)
 		return;
 
-	// Initialize RNG state with a unique seed for each particle
 	particles[i].rngState = 1234u + i * 9781u;
-
 	particles[i].spawn(width, height, depth);
 }
 
@@ -60,7 +63,6 @@ __global__ void updateParticlesKernel(Particle* particles, int numParticles, uns
 		return;
 
 	Particle& particle = particles[i];
-
 	particle.applyPhysics(deltaTime);
 	particle.handleWalls(width, depth);
 
@@ -98,7 +100,6 @@ __global__ void calculateParticleStatsKernel(Particle* particles, int numParticl
 
 	sharedActive[threadId] = localActive;
 	sharedTemperature[threadId] = localTemperature;
-
 	__syncthreads();
 
 	for (int stride = blockDim.x / 2; stride > 0; stride /= 2)
@@ -159,10 +160,7 @@ __global__ void buildGridKernel(Particle* particles, int numParticles, int* cell
 __global__ void mergeParticlesKernel(Particle* particles, int numParticles, int* cellHeads, int* nextParticle, unsigned int* mergeCount)
 {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i >= numParticles)
-		return;
-
-	if (particles[i].active != 1)
+	if (i >= numParticles || particles[i].active != 1)
 		return;
 	
 	float3 position = particles[i].position;
@@ -190,12 +188,9 @@ __global__ void mergeParticlesKernel(Particle* particles, int numParticles, int*
 				if (neighborX < 0 || neighborX >= GRID_X ||
 					neighborY < 0 || neighborY >= GRID_Y ||
 					neighborZ < 0 || neighborZ >= GRID_Z)
-				{
 					continue;
-				}
 
 				int neighbourCell = (neighborY * GRID_Z + neighborZ) * GRID_X + neighborX;
-
 				int j = cellHeads[neighbourCell];
 
 				while (j != -1)
@@ -203,11 +198,11 @@ __global__ void mergeParticlesKernel(Particle* particles, int numParticles, int*
 					if (j != i && particles[j].active == 1)
 					{
 						float3 otherPosition = particles[j].position;
-
 						float dx = position.x - otherPosition.x;
 						float dy = position.y - otherPosition.y;
 						float dz = position.z - otherPosition.z;
 						float distSq = dx * dx + dy * dy + dz * dz;
+
 						if (distSq <= collisionDistanceSq)
 						{
 							if (atomicCAS(&particles[i].active, 1, 2) != 1)
@@ -217,16 +212,14 @@ __global__ void mergeParticlesKernel(Particle* particles, int numParticles, int*
 							{
 								particles[i].mergeWith(particles[j]);
 								atomicAdd(mergeCount, 1u);
-
-								particles[i].active = 3; // Mark as merged but not yet unlocked
+								particles[i].active = 3;
 								return;
 							}
 
-							particles[i].active = 1; // Unlock if merge failed
+							particles[i].active = 1;
 						}
 					}
 
-					// Move to the next particle in the cell
 					j = nextParticle[j];
 				}
 			}
@@ -237,16 +230,97 @@ __global__ void mergeParticlesKernel(Particle* particles, int numParticles, int*
 __global__ void resetSurvivorsKernel(Particle* particles, int numParticles)
 {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
-
 	if (i >= numParticles)
 		return;
 
 	if (particles[i].active == 3)
+		particles[i].active = 1;
+}
+
+__device__ void writeRenderVertex(RenderVertex* vertices, unsigned int slot, const Particle& particle, int renderMode)
+{
+	RenderVertex& vertex = vertices[slot];
+	vertex.x = particle.position.x - WIDTH * 0.5f;
+	vertex.y = particle.position.y - HEIGHT * 0.5f;
+	vertex.z = particle.position.z - DEPTH * 0.5f;
+
+	if (renderMode == 0)
 	{
-		particles[i].active = 1; // Unlock merged particles for the next iteration
+		float t = fminf(1.0f, fmaxf(0.0f, particle.temperature));
+		vertex.r = t;
+		vertex.g = 0.0f;
+		vertex.b = 1.0f - t;
+	}
+	else if (particle.mass < 1.1f)
+	{
+		vertex.r = 0.0f; vertex.g = 0.5f; vertex.b = 1.0f;
+	}
+	else if (particle.mass < 2.1f)
+	{
+		vertex.r = 0.0f; vertex.g = 1.0f; vertex.b = 0.0f;
+	}
+	else if (particle.mass < 3.1f)
+	{
+		vertex.r = 1.0f; vertex.g = 1.0f; vertex.b = 0.0f;
+	}
+	else
+	{
+		vertex.r = 1.0f; vertex.g = 0.0f; vertex.b = 0.0f;
 	}
 }
 
+__global__ void sampleRenderVerticesKernel(
+	const Particle* particles,
+	int numParticles,
+	int renderStride,
+	RenderVertex* renderVertices,
+	unsigned int* sampleCount,
+	const unsigned int* priorityCount,
+	unsigned int priorityQuota,
+	unsigned int maxRenderVertices,
+	int renderMode)
+{
+	int group = blockIdx.x * blockDim.x + threadIdx.x;
+	int start = group * renderStride;
+	if (start >= numParticles)
+		return;
+
+	int end = min(start + renderStride, numParticles);
+	for (int i = start; i < end; ++i)
+	{
+		if (particles[i].active != 1)
+			continue;
+
+		unsigned int base = priorityCount == nullptr ? 0u : min(*priorityCount, priorityQuota);
+		unsigned int localSlot = atomicAdd(sampleCount, 1u);
+		unsigned int outputSlot = base + localSlot;
+		if (outputSlot < maxRenderVertices)
+			writeRenderVertex(renderVertices, outputSlot, particles[i], renderMode);
+		return;
+	}
+}
+
+__global__ void collectMassTierKernel(
+	const Particle* particles,
+	int numParticles,
+	float minMass,
+	float maxMass,
+	RenderVertex* renderVertices,
+	unsigned int* priorityCount,
+	unsigned int priorityQuota)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= numParticles || particles[i].active != 1)
+		return;
+
+	float mass = particles[i].mass;
+	if (mass < minMass || mass >= maxMass)
+		return;
+
+	unsigned int slot = atomicAdd(priorityCount, 1u);
+	if (slot < priorityQuota)
+		writeRenderVertex(renderVertices, slot, particles[i], 1);
+}
 
 using ProfileClock = std::chrono::steady_clock;
 
@@ -275,8 +349,8 @@ struct ProfileWindow
 	{
 		static const char* names[] = {
 			"Physics GPU", "Grid clear GPU", "Grid build GPU", "Collision/merge GPU",
-			"Survivor reset GPU", "Temperature GPU", "Particle D2H wall",
-			"CPU vertices wall", "Render+swap wall", "Simulation wall",
+			"Survivor reset GPU", "Temperature GPU", "Compact render selection+D2H wall",
+			"CPU compact-buffer prep wall", "Render+swap wall", "Simulation wall",
 			"Frame through swap wall (excludes stats/logging)"
 		};
 		const auto oldFlags = std::cout.flags();
@@ -294,11 +368,8 @@ struct ProfileWindow
 
 void runCudaSimulationStep(Particle* d_particles, unsigned int* d_floorHits, int* d_cellHeads, int* d_nextParticle, unsigned int* d_frameMerges, int blocks, cudaEvent_t* stageEvents, int* d_occupiedCells, unsigned int* d_occupiedCellCount)
 {
-	// All work uses the default CUDA stream, so these operations execute in order
-	// without forcing the CPU to wait after every kernel launch.
 	updateParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_floorHits, DELTA_TIME, WIDTH, HEIGHT, DEPTH);
 	checkCudaError(cudaGetLastError());
-
 	checkCudaError(cudaEventRecord(stageEvents[1]));
 
 	clearOccupiedCellsKernel << <blocks, BLOCK_SIZE >> > (d_cellHeads, d_occupiedCells, d_occupiedCellCount);
@@ -308,18 +379,15 @@ void runCudaSimulationStep(Particle* d_particles, unsigned int* d_floorHits, int
 
 	buildGridKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle, d_occupiedCells, d_occupiedCellCount);
 	checkCudaError(cudaGetLastError());
-
 	checkCudaError(cudaEventRecord(stageEvents[3]));
 
 	checkCudaError(cudaMemset(d_frameMerges, 0, sizeof(unsigned int)));
 	mergeParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle, d_frameMerges);
 	checkCudaError(cudaGetLastError());
-
 	checkCudaError(cudaEventRecord(stageEvents[4]));
 
 	resetSurvivorsKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES);
 	checkCudaError(cudaGetLastError());
-
 	checkCudaError(cudaEventRecord(stageEvents[5]));
 
 	updateTemperatureKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, DELTA_TIME);
@@ -332,16 +400,18 @@ int main()
 	unsigned int* d_floorHits = nullptr;
 	unsigned int* d_activeParticles = nullptr;
 	float* d_totalTemperature = nullptr;
-
 	int* d_cellHeads = nullptr;
 	int* d_nextParticle = nullptr;
 	int* d_occupiedCells = nullptr;
 	unsigned int* d_occupiedCellCount = nullptr;
 	unsigned int* d_frameMerges = nullptr;
+	RenderVertex* d_renderVertices = nullptr;
+	unsigned int* d_priorityRenderCount = nullptr;
+	unsigned int* d_sampleRenderCount = nullptr;
 	unsigned int totalMerges = 0;
 	unsigned int mergesSinceLastLog = 0;
 
-    checkCudaError(cudaMalloc(&d_particles, NUM_PARTICLES * sizeof(Particle)));
+	checkCudaError(cudaMalloc(&d_particles, NUM_PARTICLES * sizeof(Particle)));
 	checkCudaError(cudaMalloc(&d_floorHits, sizeof(unsigned int)));
 	checkCudaError(cudaMalloc(&d_activeParticles, sizeof(unsigned int)));
 	checkCudaError(cudaMalloc(&d_totalTemperature, sizeof(float)));
@@ -349,11 +419,16 @@ int main()
 	checkCudaError(cudaMalloc(&d_nextParticle, NUM_PARTICLES * sizeof(int)));
 	checkCudaError(cudaMalloc(&d_occupiedCells, NUM_PARTICLES * sizeof(int)));
 	checkCudaError(cudaMalloc(&d_occupiedCellCount, sizeof(unsigned int)));
+	checkCudaError(cudaMalloc(&d_frameMerges, sizeof(unsigned int)));
+	checkCudaError(cudaMalloc(&d_renderVertices, MAX_RENDER_VERTICES * sizeof(RenderVertex)));
+	checkCudaError(cudaMalloc(&d_priorityRenderCount, sizeof(unsigned int)));
+	checkCudaError(cudaMalloc(&d_sampleRenderCount, sizeof(unsigned int)));
 	checkCudaError(cudaMemset(d_cellHeads, -1, NUM_CELLS * sizeof(int)));
 	checkCudaError(cudaMemset(d_occupiedCellCount, 0, sizeof(unsigned int)));
-	checkCudaError(cudaMalloc(&d_frameMerges, sizeof(unsigned int)));
 
 	int blocks = (NUM_PARTICLES + BLOCK_SIZE - 1) / BLOCK_SIZE;
+	int renderGroups = (NUM_PARTICLES + RENDER_STRIDE - 1) / RENDER_STRIDE;
+	int renderBlocks = (renderGroups + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
 	cudaEvent_t stageEvents[7];
 	for (auto& event : stageEvents) checkCudaError(cudaEventCreate(&event));
@@ -361,8 +436,8 @@ int main()
 	const cudaEvent_t endEvent = stageEvents[6];
 	ProfileWindow profileWindow;
 	std::cout << "Profiling enabled: CUDA event intervals and CPU wall timings. "
-		<< "Render+swap includes submission/presentation waits, not isolated GPU rendering. "
-		<< "Timings overlap (simulation wall includes GPU work); do not add all rows.\n";
+		<< "Rendering now transfers only compact GPU-selected RenderVertex data. "
+		<< "Render+swap includes submission/presentation waits.\n";
 
 	float totalGpuFrameTime = 0.0f;
 
@@ -371,16 +446,11 @@ int main()
 	checkCudaError(cudaDeviceSynchronize());
 
 	OpenGLRenderer renderer(900, 700, "CUDA Shower Simulation");
-
-	std::vector<Particle> h_particles(NUM_PARTICLES);	
-
-	std::vector<RenderVertex> particleVertices;
+	std::vector<RenderVertex> particleVertices(MAX_RENDER_VERTICES);
 	std::vector<RenderVertex> cubicleVertices = buildCubicleVertices(WIDTH, HEIGHT, DEPTH);
 	std::vector<RenderVertex> showerHeadVertices = buildShowerHeadVertices(WIDTH, HEIGHT, DEPTH, EMITTER_RADIUS);
 
 	RenderMode renderMode = RenderMode::Mass;
-
-	int renderStride = 100;
 	int frame = 0;
 
 	while (!renderer.shouldClose())
@@ -390,28 +460,20 @@ int main()
 		renderer.pollEvents();
 
 		if (renderer.isKeyPressed(GLFW_KEY_ESCAPE))
-		{
 			break;
-		}
 
 		if (renderer.isKeyPressed(GLFW_KEY_T))
-		{
 			renderMode = RenderMode::Thermal;
-		}
-		
 		if (renderer.isKeyPressed(GLFW_KEY_M))
-		{
 			renderMode = RenderMode::Mass;
-		}
 
 		const auto simulationStart = ProfileClock::now();
 		checkCudaError(cudaEventRecord(startEvent));
-
 		runCudaSimulationStep(d_particles, d_floorHits, d_cellHeads, d_nextParticle, d_frameMerges, blocks, stageEvents, d_occupiedCells, d_occupiedCellCount);
-
 		checkCudaError(cudaEventRecord(endEvent));
 		checkCudaError(cudaEventSynchronize(endEvent));
 		timings[9] = millisecondsSince(simulationStart);
+
 		for (int stage = 0; stage < 6; ++stage)
 		{
 			float elapsed = 0.0f;
@@ -422,7 +484,6 @@ int main()
 		unsigned int frameMerges = 0;
 		checkCudaError(cudaMemcpy(&frameMerges, d_frameMerges, sizeof(unsigned int), cudaMemcpyDeviceToHost));
 		totalMerges += frameMerges;
-
 		mergesSinceLastLog += frameMerges;
 
 		float frameMilliseconds = 0.0f;
@@ -430,18 +491,54 @@ int main()
 		totalGpuFrameTime += frameMilliseconds;
 
 		const auto transferStart = ProfileClock::now();
-		checkCudaError(cudaMemcpy(h_particles.data(), d_particles, NUM_PARTICLES * sizeof(Particle), cudaMemcpyDeviceToHost));
+		checkCudaError(cudaMemset(d_priorityRenderCount, 0, sizeof(unsigned int)));
+		checkCudaError(cudaMemset(d_sampleRenderCount, 0, sizeof(unsigned int)));
 
+		if (renderMode == RenderMode::Mass)
+		{
+			collectMassTierKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, 4.0f, 1.0e30f, d_renderVertices, d_priorityRenderCount, MASS_PRIORITY_QUOTA);
+			checkCudaError(cudaGetLastError());
+			collectMassTierKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, 3.0f, 4.0f, d_renderVertices, d_priorityRenderCount, MASS_PRIORITY_QUOTA);
+			checkCudaError(cudaGetLastError());
+			collectMassTierKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, 2.0f, 3.0f, d_renderVertices, d_priorityRenderCount, MASS_PRIORITY_QUOTA);
+			checkCudaError(cudaGetLastError());
+			collectMassTierKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, 1.05f, 2.0f, d_renderVertices, d_priorityRenderCount, MASS_PRIORITY_QUOTA);
+			checkCudaError(cudaGetLastError());
+
+			sampleRenderVerticesKernel << <renderBlocks, BLOCK_SIZE >> > (
+				d_particles, NUM_PARTICLES, RENDER_STRIDE, d_renderVertices,
+				d_sampleRenderCount, d_priorityRenderCount, MASS_PRIORITY_QUOTA,
+				MAX_RENDER_VERTICES, 1);
+		}
+		else
+		{
+			sampleRenderVerticesKernel << <renderBlocks, BLOCK_SIZE >> > (
+				d_particles, NUM_PARTICLES, RENDER_STRIDE, d_renderVertices,
+				d_sampleRenderCount, nullptr, 0, MAX_RENDER_VERTICES, 0);
+		}
+		checkCudaError(cudaGetLastError());
+
+		unsigned int priorityCount = 0;
+		unsigned int sampleCount = 0;
+		if (renderMode == RenderMode::Mass)
+			checkCudaError(cudaMemcpy(&priorityCount, d_priorityRenderCount, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+		checkCudaError(cudaMemcpy(&sampleCount, d_sampleRenderCount, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+
+		unsigned int priorityUsed = renderMode == RenderMode::Mass ? std::min(priorityCount, static_cast<unsigned int>(MASS_PRIORITY_QUOTA)) : 0u;
+		unsigned int sampleCapacity = MAX_RENDER_VERTICES - priorityUsed;
+		unsigned int sampleUsed = std::min(sampleCount, sampleCapacity);
+		unsigned int renderCount = priorityUsed + sampleUsed;
+
+		const auto prepStart = ProfileClock::now();
+		particleVertices.resize(renderCount);
+		timings[7] = millisecondsSince(prepStart);
+
+		if (renderCount > 0)
+			checkCudaError(cudaMemcpy(particleVertices.data(), d_renderVertices, renderCount * sizeof(RenderVertex), cudaMemcpyDeviceToHost));
 		timings[6] = millisecondsSince(transferStart);
-
-		const auto verticesStart = ProfileClock::now();
-		particleVertices = buildRenderVertices(h_particles, renderMode, renderStride, WIDTH, HEIGHT, DEPTH);
-
-		timings[7] = millisecondsSince(verticesStart);
 
 		const auto renderStart = ProfileClock::now();
 		renderer.drawFrame(particleVertices, cubicleVertices, showerHeadVertices);
-
 		timings[8] = millisecondsSince(renderStart);
 		timings[10] = millisecondsSince(frameStart);
 		profileWindow.add(timings);
@@ -467,6 +564,7 @@ int main()
 
 			std::cout << "Frame: " << frame
 				<< " | Active Particles: " << activeParticles
+				<< " | Rendered Vertices: " << renderCount
 				<< " | Floor Hits: " << floorHits
 				<< " | Merges Since Last Log: " << mergesSinceLastLog
 				<< " | Total Merges: " << totalMerges
@@ -492,8 +590,11 @@ int main()
 	checkCudaError(cudaFree(d_nextParticle));
 	checkCudaError(cudaFree(d_occupiedCells));
 	checkCudaError(cudaFree(d_occupiedCellCount));
-	for (auto event : stageEvents) checkCudaError(cudaEventDestroy(event));
 	checkCudaError(cudaFree(d_frameMerges));
+	checkCudaError(cudaFree(d_renderVertices));
+	checkCudaError(cudaFree(d_priorityRenderCount));
+	checkCudaError(cudaFree(d_sampleRenderCount));
+	for (auto event : stageEvents) checkCudaError(cudaEventDestroy(event));
 
 	return 0;
 }
