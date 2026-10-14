@@ -32,7 +32,7 @@ constexpr int GRID_Z = static_cast<int>(DEPTH / CELL_SIZE) + 1;
 constexpr int NUM_CELLS = GRID_X * GRID_Y * GRID_Z;
 
 static_assert(NUM_CELLS > 0, "NUM_CELLS must be positive");
-static_assert(CELL_SIZE >= COLLISION_RADIUS, "CELL_SIZE must be at least as large as COLLISION_RADIUS for the 27-cell neighbour search");
+static_assert(CELL_SIZE >= COLLISION_RADIUS, "CELL_SIZE must be at least as large as COLLISION_RADIUS for the bounded neighbour search");
 static_assert(MAX_RENDER_VERTICES > 0, "MAX_RENDER_VERTICES must be positive");
 
 #define checkCudaError(call) \
@@ -162,34 +162,34 @@ __global__ void mergeParticlesKernel(Particle* particles, int numParticles, int*
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= numParticles || particles[i].active != 1)
 		return;
-	
+
 	float3 position = particles[i].position;
-
-	int cellX = static_cast<int>(position.x / CELL_SIZE);
-	int cellY = static_cast<int>(position.y / CELL_SIZE);
-	int cellZ = static_cast<int>(position.z / CELL_SIZE);
-
-	cellX = max(0, min(cellX, GRID_X - 1));
-	cellY = max(0, min(cellY, GRID_Y - 1));
-	cellZ = max(0, min(cellZ, GRID_Z - 1));
-
 	float collisionDistanceSq = COLLISION_RADIUS * COLLISION_RADIUS;
 
-	for (int y = -1; y <= 1; y++)
+	// Only visit grid cells that intersect this particle's collision-radius bounds.
+	// Because CELL_SIZE is much larger than COLLISION_RADIUS, this is normally one
+	// cell per axis and at most two per axis near a cell boundary, rather than a
+	// fixed 3x3x3 neighbourhood for every particle.
+	int minCellX = static_cast<int>(floorf((position.x - COLLISION_RADIUS) / CELL_SIZE));
+	int maxCellX = static_cast<int>(floorf((position.x + COLLISION_RADIUS) / CELL_SIZE));
+	int minCellY = static_cast<int>(floorf((position.y - COLLISION_RADIUS) / CELL_SIZE));
+	int maxCellY = static_cast<int>(floorf((position.y + COLLISION_RADIUS) / CELL_SIZE));
+	int minCellZ = static_cast<int>(floorf((position.z - COLLISION_RADIUS) / CELL_SIZE));
+	int maxCellZ = static_cast<int>(floorf((position.z + COLLISION_RADIUS) / CELL_SIZE));
+
+	minCellX = max(0, min(minCellX, GRID_X - 1));
+	maxCellX = max(0, min(maxCellX, GRID_X - 1));
+	minCellY = max(0, min(minCellY, GRID_Y - 1));
+	maxCellY = max(0, min(maxCellY, GRID_Y - 1));
+	minCellZ = max(0, min(minCellZ, GRID_Z - 1));
+	maxCellZ = max(0, min(maxCellZ, GRID_Z - 1));
+
+	for (int neighborY = minCellY; neighborY <= maxCellY; ++neighborY)
 	{
-		for (int z = -1; z <= 1; z++)
+		for (int neighborZ = minCellZ; neighborZ <= maxCellZ; ++neighborZ)
 		{
-			for (int x = -1; x <= 1; x++)
+			for (int neighborX = minCellX; neighborX <= maxCellX; ++neighborX)
 			{
-				int neighborX = cellX + x;
-				int neighborY = cellY + y;
-				int neighborZ = cellZ + z;
-
-				if (neighborX < 0 || neighborX >= GRID_X ||
-					neighborY < 0 || neighborY >= GRID_Y ||
-					neighborZ < 0 || neighborZ >= GRID_Z)
-					continue;
-
 				int neighbourCell = (neighborY * GRID_Z + neighborZ) * GRID_X + neighborX;
 				int j = cellHeads[neighbourCell];
 
@@ -225,7 +225,7 @@ __global__ void mergeParticlesKernel(Particle* particles, int numParticles, int*
 			}
 		}
 	}
-}	
+}
 
 __global__ void resetSurvivorsKernel(Particle* particles, int numParticles)
 {
@@ -395,7 +395,7 @@ void runCudaSimulationStep(Particle* d_particles, unsigned int* d_floorHits, int
 }
 
 int main()
-{	
+{
 	Particle* d_particles = nullptr;
 	unsigned int* d_floorHits = nullptr;
 	unsigned int* d_activeParticles = nullptr;
