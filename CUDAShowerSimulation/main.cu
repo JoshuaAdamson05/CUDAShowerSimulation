@@ -18,9 +18,6 @@ constexpr float HEIGHT = 2.0f;
 constexpr float DEPTH = 1.0f;
 constexpr float DELTA_TIME = 1.0f / 60.0f;
 constexpr float COLLISION_RADIUS = 0.0001f;
-// Finer cells reduce unrelated candidates in the 27-cell neighbour search.
-// Compare grid clear+build plus collision timings against the 0.01f baseline;
-// the dense cell-head array now uses approximately 65 MB.
 constexpr float CELL_SIZE = 0.005f;
 constexpr float EMITTER_RADIUS = 0.05f;
 
@@ -134,7 +131,14 @@ __device__ int getCellIndex(float3 position)
 	return (cellY * GRID_Z + cellZ) * GRID_X + cellX;
 }
 
-__global__ void buildGridKernel(Particle* particles, int numParticles, int* cellHeads, int* nextParticle)
+__global__ void clearOccupiedCellsKernel(int* cellHeads, const int* occupiedCells, const unsigned int* occupiedCellCount)
+{
+	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < *occupiedCellCount)
+		cellHeads[occupiedCells[i]] = -1;
+}
+
+__global__ void buildGridKernel(Particle* particles, int numParticles, int* cellHeads, int* nextParticle, int* occupiedCells, unsigned int* occupiedCellCount)
 {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -142,7 +146,14 @@ __global__ void buildGridKernel(Particle* particles, int numParticles, int* cell
 		return;
 
 	int cellIndex = getCellIndex(particles[i].position);
-	nextParticle[i] = atomicExch(&cellHeads[cellIndex], i);
+	int previousHead = atomicExch(&cellHeads[cellIndex], i);
+	nextParticle[i] = previousHead;
+
+	if (previousHead == -1)
+	{
+		unsigned int slot = atomicAdd(occupiedCellCount, 1u);
+		occupiedCells[slot] = cellIndex;
+	}
 }
 
 __global__ void mergeParticlesKernel(Particle* particles, int numParticles, int* cellHeads, int* nextParticle, unsigned int* mergeCount)
@@ -246,11 +257,11 @@ double millisecondsSince(ProfileClock::time_point start)
 
 struct ProfileWindow
 {
-	std::array<double, 10> sums{};
-	std::array<double, 10> peaks{};
+	std::array<double, 11> sums{};
+	std::array<double, 11> peaks{};
 	int samples = 0;
 
-	void add(const std::array<double, 10>& values)
+	void add(const std::array<double, 11>& values)
 	{
 		for (size_t i = 0; i < values.size(); ++i)
 		{
@@ -263,7 +274,7 @@ struct ProfileWindow
 	void print(int lastFrame) const
 	{
 		static const char* names[] = {
-			"Physics GPU", "Grid clear+build GPU", "Collision/merge GPU",
+			"Physics GPU", "Grid clear GPU", "Grid build GPU", "Collision/merge GPU",
 			"Survivor reset GPU", "Temperature GPU", "Particle D2H wall",
 			"CPU vertices wall", "Render+swap wall", "Simulation wall",
 			"Frame through swap wall (excludes stats/logging)"
@@ -281,7 +292,7 @@ struct ProfileWindow
 	}
 };
 
-void runCudaSimulationStep(Particle* d_particles, unsigned int* d_floorHits, int* d_cellHeads, int* d_nextParticle, unsigned int* d_frameMerges, int blocks, cudaEvent_t* stageEvents)
+void runCudaSimulationStep(Particle* d_particles, unsigned int* d_floorHits, int* d_cellHeads, int* d_nextParticle, unsigned int* d_frameMerges, int blocks, cudaEvent_t* stageEvents, int* d_occupiedCells, unsigned int* d_occupiedCellCount)
 {
 	// All work uses the default CUDA stream, so these operations execute in order
 	// without forcing the CPU to wait after every kernel launch.
@@ -290,23 +301,26 @@ void runCudaSimulationStep(Particle* d_particles, unsigned int* d_floorHits, int
 
 	checkCudaError(cudaEventRecord(stageEvents[1]));
 
-	checkCudaError(cudaMemset(d_cellHeads, -1, NUM_CELLS * sizeof(int)));
+	clearOccupiedCellsKernel << <blocks, BLOCK_SIZE >> > (d_cellHeads, d_occupiedCells, d_occupiedCellCount);
+	checkCudaError(cudaGetLastError());
+	checkCudaError(cudaMemset(d_occupiedCellCount, 0, sizeof(unsigned int)));
+	checkCudaError(cudaEventRecord(stageEvents[2]));
 
-	buildGridKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle);
+	buildGridKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle, d_occupiedCells, d_occupiedCellCount);
 	checkCudaError(cudaGetLastError());
 
-	checkCudaError(cudaEventRecord(stageEvents[2]));
+	checkCudaError(cudaEventRecord(stageEvents[3]));
 
 	checkCudaError(cudaMemset(d_frameMerges, 0, sizeof(unsigned int)));
 	mergeParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle, d_frameMerges);
 	checkCudaError(cudaGetLastError());
 
-	checkCudaError(cudaEventRecord(stageEvents[3]));
+	checkCudaError(cudaEventRecord(stageEvents[4]));
 
 	resetSurvivorsKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES);
 	checkCudaError(cudaGetLastError());
 
-	checkCudaError(cudaEventRecord(stageEvents[4]));
+	checkCudaError(cudaEventRecord(stageEvents[5]));
 
 	updateTemperatureKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, DELTA_TIME);
 	checkCudaError(cudaGetLastError());
@@ -321,6 +335,8 @@ int main()
 
 	int* d_cellHeads = nullptr;
 	int* d_nextParticle = nullptr;
+	int* d_occupiedCells = nullptr;
+	unsigned int* d_occupiedCellCount = nullptr;
 	unsigned int* d_frameMerges = nullptr;
 	unsigned int totalMerges = 0;
 	unsigned int mergesSinceLastLog = 0;
@@ -331,15 +347,18 @@ int main()
 	checkCudaError(cudaMalloc(&d_totalTemperature, sizeof(float)));
 	checkCudaError(cudaMalloc(&d_cellHeads, NUM_CELLS * sizeof(int)));
 	checkCudaError(cudaMalloc(&d_nextParticle, NUM_PARTICLES * sizeof(int)));
+	checkCudaError(cudaMalloc(&d_occupiedCells, NUM_PARTICLES * sizeof(int)));
+	checkCudaError(cudaMalloc(&d_occupiedCellCount, sizeof(unsigned int)));
+	checkCudaError(cudaMemset(d_cellHeads, -1, NUM_CELLS * sizeof(int)));
+	checkCudaError(cudaMemset(d_occupiedCellCount, 0, sizeof(unsigned int)));
 	checkCudaError(cudaMalloc(&d_frameMerges, sizeof(unsigned int)));
 
 	int blocks = (NUM_PARTICLES + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-	// Adjacent GPU events share boundaries; only the final event is synchronized.
-	cudaEvent_t stageEvents[6];
+	cudaEvent_t stageEvents[7];
 	for (auto& event : stageEvents) checkCudaError(cudaEventCreate(&event));
 	const cudaEvent_t startEvent = stageEvents[0];
-	const cudaEvent_t endEvent = stageEvents[5];
+	const cudaEvent_t endEvent = stageEvents[6];
 	ProfileWindow profileWindow;
 	std::cout << "Profiling enabled: CUDA event intervals and CPU wall timings. "
 		<< "Render+swap includes submission/presentation waits, not isolated GPU rendering. "
@@ -367,7 +386,7 @@ int main()
 	while (!renderer.shouldClose())
 	{
 		const auto frameStart = ProfileClock::now();
-		std::array<double, 10> timings{};
+		std::array<double, 11> timings{};
 		renderer.pollEvents();
 
 		if (renderer.isKeyPressed(GLFW_KEY_ESCAPE))
@@ -388,12 +407,12 @@ int main()
 		const auto simulationStart = ProfileClock::now();
 		checkCudaError(cudaEventRecord(startEvent));
 
-		runCudaSimulationStep(d_particles, d_floorHits, d_cellHeads, d_nextParticle, d_frameMerges, blocks, stageEvents);
+		runCudaSimulationStep(d_particles, d_floorHits, d_cellHeads, d_nextParticle, d_frameMerges, blocks, stageEvents, d_occupiedCells, d_occupiedCellCount);
 
 		checkCudaError(cudaEventRecord(endEvent));
 		checkCudaError(cudaEventSynchronize(endEvent));
-		timings[8] = millisecondsSince(simulationStart);
-		for (int stage = 0; stage < 5; ++stage)
+		timings[9] = millisecondsSince(simulationStart);
+		for (int stage = 0; stage < 6; ++stage)
 		{
 			float elapsed = 0.0f;
 			checkCudaError(cudaEventElapsedTime(&elapsed, stageEvents[stage], stageEvents[stage + 1]));
@@ -413,18 +432,18 @@ int main()
 		const auto transferStart = ProfileClock::now();
 		checkCudaError(cudaMemcpy(h_particles.data(), d_particles, NUM_PARTICLES * sizeof(Particle), cudaMemcpyDeviceToHost));
 
-		timings[5] = millisecondsSince(transferStart);
+		timings[6] = millisecondsSince(transferStart);
 
 		const auto verticesStart = ProfileClock::now();
 		particleVertices = buildRenderVertices(h_particles, renderMode, renderStride, WIDTH, HEIGHT, DEPTH);
 
-		timings[6] = millisecondsSince(verticesStart);
+		timings[7] = millisecondsSince(verticesStart);
 
 		const auto renderStart = ProfileClock::now();
 		renderer.drawFrame(particleVertices, cubicleVertices, showerHeadVertices);
 
-		timings[7] = millisecondsSince(renderStart);
-		timings[9] = millisecondsSince(frameStart);
+		timings[8] = millisecondsSince(renderStart);
+		timings[10] = millisecondsSince(frameStart);
 		profileWindow.add(timings);
 
 		if (frame % 300 == 0)
@@ -471,6 +490,8 @@ int main()
 	checkCudaError(cudaFree(d_totalTemperature));
 	checkCudaError(cudaFree(d_cellHeads));
 	checkCudaError(cudaFree(d_nextParticle));
+	checkCudaError(cudaFree(d_occupiedCells));
+	checkCudaError(cudaFree(d_occupiedCellCount));
 	for (auto event : stageEvents) checkCudaError(cudaEventDestroy(event));
 	checkCudaError(cudaFree(d_frameMerges));
 
