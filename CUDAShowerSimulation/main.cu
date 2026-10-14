@@ -235,28 +235,25 @@ __global__ void resetSurvivorsKernel(Particle* particles, int numParticles)
 
 void runCudaSimulationStep(Particle* d_particles, unsigned int* d_floorHits, int* d_cellHeads, int* d_nextParticle, unsigned int* d_frameMerges, int blocks)
 {
+	// All work uses the default CUDA stream, so these operations execute in order
+	// without forcing the CPU to wait after every kernel launch.
 	updateParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_floorHits, DELTA_TIME, WIDTH, HEIGHT, DEPTH);
 	checkCudaError(cudaGetLastError());
-	checkCudaError(cudaDeviceSynchronize());
 
 	checkCudaError(cudaMemset(d_cellHeads, -1, NUM_CELLS * sizeof(int)));
 
 	buildGridKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle);
 	checkCudaError(cudaGetLastError());
-	checkCudaError(cudaDeviceSynchronize());
 
 	checkCudaError(cudaMemset(d_frameMerges, 0, sizeof(unsigned int)));
 	mergeParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle, d_frameMerges);
 	checkCudaError(cudaGetLastError());
-	checkCudaError(cudaDeviceSynchronize());
 
 	resetSurvivorsKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES);
 	checkCudaError(cudaGetLastError());
-	checkCudaError(cudaDeviceSynchronize());
 
 	updateTemperatureKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, DELTA_TIME);
 	checkCudaError(cudaGetLastError());
-	checkCudaError(cudaDeviceSynchronize());
 }
 
 int main()
