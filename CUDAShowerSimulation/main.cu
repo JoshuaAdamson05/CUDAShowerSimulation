@@ -18,10 +18,10 @@ constexpr float HEIGHT = 2.0f;
 constexpr float DEPTH = 1.0f;
 constexpr float DELTA_TIME = 1.0f / 60.0f;
 constexpr float COLLISION_RADIUS = 0.0001f;
-// A smaller grid cell reduces the number of unrelated particles examined during
-// neighbour searches. 0.01f is a conservative first step from the original
-// 0.02f without making the dense grid excessively large.
-constexpr float CELL_SIZE = 0.01f;
+// Finer cells reduce unrelated candidates in the 27-cell neighbour search.
+// Compare grid clear+build plus collision timings against the 0.01f baseline;
+// the dense cell-head array now uses approximately 65 MB.
+constexpr float CELL_SIZE = 0.005f;
 constexpr float EMITTER_RADIUS = 0.05f;
 
 constexpr int GRID_X = static_cast<int>(WIDTH / CELL_SIZE) + 1;
