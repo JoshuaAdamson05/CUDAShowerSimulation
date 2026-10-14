@@ -15,7 +15,10 @@ constexpr float HEIGHT = 2.0f;
 constexpr float DEPTH = 1.0f;
 constexpr float DELTA_TIME = 1.0f / 60.0f;
 constexpr float COLLISION_RADIUS = 0.0001f;
-constexpr float CELL_SIZE = 0.02f;
+// A smaller grid cell reduces the number of unrelated particles examined during
+// neighbour searches. 0.01f is a conservative first step from the original
+// 0.02f without making the dense grid excessively large.
+constexpr float CELL_SIZE = 0.01f;
 constexpr float EMITTER_RADIUS = 0.05f;
 
 constexpr int GRID_X = static_cast<int>(WIDTH / CELL_SIZE) + 1;
@@ -25,6 +28,7 @@ constexpr int GRID_Z = static_cast<int>(DEPTH / CELL_SIZE) + 1;
 constexpr int NUM_CELLS = GRID_X * GRID_Y * GRID_Z;
 
 static_assert(NUM_CELLS > 0, "NUM_CELLS must be positive");
+static_assert(CELL_SIZE >= COLLISION_RADIUS, "CELL_SIZE must be at least as large as COLLISION_RADIUS for the 27-cell neighbour search");
 
 #define checkCudaError(call) \
 do \
