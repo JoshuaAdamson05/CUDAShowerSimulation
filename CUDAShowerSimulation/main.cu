@@ -3,6 +3,9 @@
 
 #include <iostream>
 #include <vector>
+#include <chrono>
+#include <array>
+#include <iomanip>
 
 #include "Particle.cuh"
 #include "Rendering.h"
@@ -233,24 +236,77 @@ __global__ void resetSurvivorsKernel(Particle* particles, int numParticles)
 	}
 }
 
-void runCudaSimulationStep(Particle* d_particles, unsigned int* d_floorHits, int* d_cellHeads, int* d_nextParticle, unsigned int* d_frameMerges, int blocks)
+
+using ProfileClock = std::chrono::steady_clock;
+
+double millisecondsSince(ProfileClock::time_point start)
+{
+	return std::chrono::duration<double, std::milli>(ProfileClock::now() - start).count();
+}
+
+struct ProfileWindow
+{
+	std::array<double, 10> sums{};
+	std::array<double, 10> peaks{};
+	int samples = 0;
+
+	void add(const std::array<double, 10>& values)
+	{
+		for (size_t i = 0; i < values.size(); ++i)
+		{
+			sums[i] += values[i];
+			if (values[i] > peaks[i]) peaks[i] = values[i];
+		}
+		++samples;
+	}
+
+	void print(int lastFrame) const
+	{
+		static const char* names[] = {
+			"Physics GPU", "Grid clear+build GPU", "Collision/merge GPU",
+			"Survivor reset GPU", "Temperature GPU", "Particle D2H wall",
+			"CPU vertices wall", "Render+swap wall", "Simulation wall",
+			"Frame through swap wall (excludes stats/logging)"
+		};
+		const auto oldFlags = std::cout.flags();
+		const auto oldPrecision = std::cout.precision();
+		std::cout << std::fixed << std::setprecision(4)
+			<< "PROFILE frames " << (lastFrame - samples + 1) << "-" << lastFrame
+			<< " | samples=" << samples << " | mean / max ms\n";
+		for (size_t i = 0; i < sums.size(); ++i)
+			std::cout << "  " << names[i] << ": " << sums[i] / samples
+				<< " / " << peaks[i] << "\n";
+		std::cout.flags(oldFlags);
+		std::cout.precision(oldPrecision);
+	}
+};
+
+void runCudaSimulationStep(Particle* d_particles, unsigned int* d_floorHits, int* d_cellHeads, int* d_nextParticle, unsigned int* d_frameMerges, int blocks, cudaEvent_t* stageEvents)
 {
 	// All work uses the default CUDA stream, so these operations execute in order
 	// without forcing the CPU to wait after every kernel launch.
 	updateParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_floorHits, DELTA_TIME, WIDTH, HEIGHT, DEPTH);
 	checkCudaError(cudaGetLastError());
 
+	checkCudaError(cudaEventRecord(stageEvents[1]));
+
 	checkCudaError(cudaMemset(d_cellHeads, -1, NUM_CELLS * sizeof(int)));
 
 	buildGridKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle);
 	checkCudaError(cudaGetLastError());
 
+	checkCudaError(cudaEventRecord(stageEvents[2]));
+
 	checkCudaError(cudaMemset(d_frameMerges, 0, sizeof(unsigned int)));
 	mergeParticlesKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, d_cellHeads, d_nextParticle, d_frameMerges);
 	checkCudaError(cudaGetLastError());
 
+	checkCudaError(cudaEventRecord(stageEvents[3]));
+
 	resetSurvivorsKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES);
 	checkCudaError(cudaGetLastError());
+
+	checkCudaError(cudaEventRecord(stageEvents[4]));
 
 	updateTemperatureKernel << <blocks, BLOCK_SIZE >> > (d_particles, NUM_PARTICLES, DELTA_TIME);
 	checkCudaError(cudaGetLastError());
@@ -279,11 +335,15 @@ int main()
 
 	int blocks = (NUM_PARTICLES + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-	cudaEvent_t startEvent;
-	cudaEvent_t endEvent;
-
-	checkCudaError(cudaEventCreate(&startEvent));
-	checkCudaError(cudaEventCreate(&endEvent));
+	// Adjacent GPU events share boundaries; only the final event is synchronized.
+	cudaEvent_t stageEvents[6];
+	for (auto& event : stageEvents) checkCudaError(cudaEventCreate(&event));
+	const cudaEvent_t startEvent = stageEvents[0];
+	const cudaEvent_t endEvent = stageEvents[5];
+	ProfileWindow profileWindow;
+	std::cout << "Profiling enabled: CUDA event intervals and CPU wall timings. "
+		<< "Render+swap includes submission/presentation waits, not isolated GPU rendering. "
+		<< "Timings overlap (simulation wall includes GPU work); do not add all rows.\n";
 
 	float totalGpuFrameTime = 0.0f;
 
@@ -306,6 +366,8 @@ int main()
 
 	while (!renderer.shouldClose())
 	{
+		const auto frameStart = ProfileClock::now();
+		std::array<double, 10> timings{};
 		renderer.pollEvents();
 
 		if (renderer.isKeyPressed(GLFW_KEY_ESCAPE))
@@ -323,12 +385,20 @@ int main()
 			renderMode = RenderMode::Mass;
 		}
 
+		const auto simulationStart = ProfileClock::now();
 		checkCudaError(cudaEventRecord(startEvent));
 
-		runCudaSimulationStep(d_particles, d_floorHits, d_cellHeads, d_nextParticle, d_frameMerges, blocks);
+		runCudaSimulationStep(d_particles, d_floorHits, d_cellHeads, d_nextParticle, d_frameMerges, blocks, stageEvents);
 
 		checkCudaError(cudaEventRecord(endEvent));
 		checkCudaError(cudaEventSynchronize(endEvent));
+		timings[8] = millisecondsSince(simulationStart);
+		for (int stage = 0; stage < 5; ++stage)
+		{
+			float elapsed = 0.0f;
+			checkCudaError(cudaEventElapsedTime(&elapsed, stageEvents[stage], stageEvents[stage + 1]));
+			timings[stage] = elapsed;
+		}
 
 		unsigned int frameMerges = 0;
 		checkCudaError(cudaMemcpy(&frameMerges, d_frameMerges, sizeof(unsigned int), cudaMemcpyDeviceToHost));
@@ -340,11 +410,22 @@ int main()
 		checkCudaError(cudaEventElapsedTime(&frameMilliseconds, startEvent, endEvent));
 		totalGpuFrameTime += frameMilliseconds;
 
+		const auto transferStart = ProfileClock::now();
 		checkCudaError(cudaMemcpy(h_particles.data(), d_particles, NUM_PARTICLES * sizeof(Particle), cudaMemcpyDeviceToHost));
 
+		timings[5] = millisecondsSince(transferStart);
+
+		const auto verticesStart = ProfileClock::now();
 		particleVertices = buildRenderVertices(h_particles, renderMode, renderStride, WIDTH, HEIGHT, DEPTH);
 
+		timings[6] = millisecondsSince(verticesStart);
+
+		const auto renderStart = ProfileClock::now();
 		renderer.drawFrame(particleVertices, cubicleVertices, showerHeadVertices);
+
+		timings[7] = millisecondsSince(renderStart);
+		timings[9] = millisecondsSince(frameStart);
+		profileWindow.add(timings);
 
 		if (frame % 300 == 0)
 		{
@@ -375,10 +456,14 @@ int main()
 				<< " | Average GPU Frame Time: " << (totalGpuFrameTime / (frame + 1)) << " ms"
 				<< std::endl;
 
+			profileWindow.print(frame);
+			profileWindow = ProfileWindow{};
 			mergesSinceLastLog = 0;
 		}
 		frame++;
 	}
+
+	if (profileWindow.samples > 0) profileWindow.print(frame - 1);
 
 	checkCudaError(cudaFree(d_particles));
 	checkCudaError(cudaFree(d_activeParticles));
@@ -386,8 +471,7 @@ int main()
 	checkCudaError(cudaFree(d_totalTemperature));
 	checkCudaError(cudaFree(d_cellHeads));
 	checkCudaError(cudaFree(d_nextParticle));
-	checkCudaError(cudaEventDestroy(startEvent));
-	checkCudaError(cudaEventDestroy(endEvent));
+	for (auto event : stageEvents) checkCudaError(cudaEventDestroy(event));
 	checkCudaError(cudaFree(d_frameMerges));
 
 	return 0;
